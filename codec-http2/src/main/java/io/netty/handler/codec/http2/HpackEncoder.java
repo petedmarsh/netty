@@ -64,18 +64,24 @@ final class HpackEncoder {
     static final int NOT_FOUND = -1;
     static final int HUFF_CODE_THRESHOLD = 512;
     // a hash map of header fields keyed by header name
-    private final NameEntry[] nameEntries;
+    private NameEntry[] nameEntries;
 
     // a hash map of header fields keyed by header name and value
-    private final NameValueEntry[] nameValueEntries;
+    private NameValueEntry[] nameValueEntries;
+
+    private static final int MAX_LOCAL_TABLE_SIZE = 64 * 1024;
+    private static final int MAX_LARGE_TABLE_CHAIN_LENGTH = 16;
 
     private final NameValueEntry head = new NameValueEntry(-1, AsciiString.EMPTY_STRING,
       AsciiString.EMPTY_STRING, Integer.MAX_VALUE, null);
 
     private NameValueEntry latest = head;
 
-    private final HpackHuffmanEncoder hpackHuffmanEncoder = new HpackHuffmanEncoder();
-    private final byte hashMask;
+    // Most connections never encode a literal long enough to consider Huffman coding.
+    private HpackHuffmanEncoder hpackHuffmanEncoder;
+    // At most 1024 buckets for the 64 KiB local limit. A short also fits beside the two
+    // boolean fields without enlarging the encoder's object layout like an int does.
+    private short hashMask;
     private final boolean ignoreMaxHeaderListSize;
     private final int huffCodeThreshold;
     private long size;
@@ -106,13 +112,10 @@ final class HpackEncoder {
         this.ignoreMaxHeaderListSize = ignoreMaxHeaderListSize;
         maxHeaderTableSize = DEFAULT_HEADER_TABLE_SIZE;
         maxHeaderListSize = MAX_HEADER_LIST_SIZE;
-        // Enforce a bound of [2, 128] because hashMask is a byte. The max possible value of hashMask is one less
-        // than the length of this array, and we want the mask to be > 0. There is also simply an
-        // upper limit on how many entries can be safely held, as nameEntries will have duplicate
-        // entries every time a header name is used, and thus form a long collision chain.
+        // Keep the initial allocation small. Larger negotiated tables grow the buckets on demand.
         nameEntries = new NameEntry[findNextPositivePowerOfTwo(max(2, min(arraySizeHint, 128)))];
         nameValueEntries = new NameValueEntry[nameEntries.length];
-        hashMask = (byte) (nameEntries.length - 1);
+        hashMask = (short) (nameEntries.length - 1);
         this.huffCodeThreshold = huffCodeThreshold;
     }
 
@@ -203,25 +206,36 @@ final class HpackEncoder {
 
         int nameHash = AsciiString.hashCode(name);
         int valueHash = AsciiString.hashCode(value);
-        NameValueEntry headerField = getEntryInsensitive(name, nameHash, value, valueHash);
-        if (headerField != null) {
+        int index = getEntryInsensitive(name, nameHash, value, valueHash);
+        if (index >= 0) {
             // Section 6.1. Indexed Header Field Representation
-            encodeInteger(out, 0x80, 7, getIndexPlusOffset(headerField.counter));
+            encodeInteger(out, 0x80, 7, index);
         } else {
             int staticTableIndex = HpackStaticTable.getIndexInsensitive(name, value);
             if (staticTableIndex != HpackStaticTable.NOT_FOUND) {
                 // Section 6.1. Indexed Header Field Representation
                 encodeInteger(out, 0x80, 7, staticTableIndex);
             } else {
+                // A larger bucket array alone does not protect against adversarial hash collisions.
+                // Do not mutate either dynamic table when a chain is full: a literal without indexing
+                // remains valid HPACK and bounds both lookup and eviction work. The failed lookup
+                // already counted the value chain; only a new dynamic name needs an admission scan.
+                int staticNameIndex = HpackStaticTable.getIndex(name);
+                if (maxHeaderTableSize > DEFAULT_HEADER_TABLE_SIZE &&
+                        (~index >= MAX_LARGE_TABLE_CHAIN_LENGTH ||
+                         staticNameIndex == HpackStaticTable.NOT_FOUND && !canIndexName(name, nameHash))) {
+                    encodeLiteral(out, name, value, IndexType.NONE, getNameIndex(name));
+                    return;
+                }
                 ensureCapacity(headerSize);
-                encodeAndAddEntries(out, name, nameHash, value, valueHash);
+                encodeAndAddEntries(out, name, nameHash, value, valueHash, staticNameIndex);
                 size += headerSize;
             }
         }
     }
 
-    private void encodeAndAddEntries(ByteBuf out, CharSequence name, int nameHash, CharSequence value, int valueHash) {
-        int staticTableIndex = HpackStaticTable.getIndex(name);
+    private void encodeAndAddEntries(ByteBuf out, CharSequence name, int nameHash, CharSequence value,
+                                     int valueHash, int staticTableIndex) {
         int nextCounter = latestCounter() - 1;
         if (staticTableIndex == HpackStaticTable.NOT_FOUND) {
             NameEntry e = getEntry(name, nameHash);
@@ -252,12 +266,14 @@ final class HpackEncoder {
             throw connectionError(PROTOCOL_ERROR, "Header Table Size must be >= %d and <= %d but was %d",
               MIN_HEADER_TABLE_SIZE, MAX_HEADER_TABLE_SIZE, maxHeaderTableSize);
         }
-        // While the receiver may allow a larger table, it is important to cap the local impact of
-        // hash collisions and memory use. This allows the default 4 KiB table when using the
-        // default 64 arraySizeHint.
-        maxHeaderTableSize = Math.min(maxHeaderTableSize, nameEntries.length * 64);
+        // Bound memory independently of the peer's unsigned 32-bit limit. Collision work for
+        // larger tables is bounded separately by admission checks, not by the number of buckets.
+        maxHeaderTableSize = Math.min(maxHeaderTableSize, MAX_LOCAL_TABLE_SIZE);
         if (this.maxHeaderTableSize == maxHeaderTableSize) {
             return;
+        }
+        if (maxHeaderTableSize > DEFAULT_HEADER_TABLE_SIZE) {
+            growBuckets((int) maxHeaderTableSize);
         }
         this.pendingHeaderTableSizeUpdate = true;
         this.pendingMinHeaderTableSize = Math.min(this.pendingMinHeaderTableSize, maxHeaderTableSize);
@@ -313,22 +329,27 @@ final class HpackEncoder {
      * Encode string literal according to Section 5.2.
      */
     private void encodeStringLiteral(ByteBuf out, CharSequence string) {
-        int huffmanLength;
-        if (string.length() >= huffCodeThreshold
-          && (huffmanLength = hpackHuffmanEncoder.getEncodedLength(string)) < string.length()) {
-            encodeInteger(out, 0x80, 7, huffmanLength);
-            hpackHuffmanEncoder.encode(out, string);
-        } else {
-            encodeInteger(out, 0x00, 7, string.length());
-            if (string instanceof AsciiString) {
-                // Fast-path
-                AsciiString asciiString = (AsciiString) string;
-                out.writeBytes(asciiString.array(), asciiString.arrayOffset(), asciiString.length());
-            } else {
-                // Only ASCII is allowed in http2 headers, so it is fine to use this.
-                // https://tools.ietf.org/html/rfc7540#section-8.1.2
-                out.writeCharSequence(string, CharsetUtil.ISO_8859_1);
+        if (string.length() >= huffCodeThreshold) {
+            HpackHuffmanEncoder encoder = hpackHuffmanEncoder;
+            if (encoder == null) {
+                hpackHuffmanEncoder = encoder = new HpackHuffmanEncoder();
             }
+            int huffmanLength = encoder.getEncodedLength(string);
+            if (huffmanLength < string.length()) {
+                encodeInteger(out, 0x80, 7, huffmanLength);
+                encoder.encode(out, string);
+                return;
+            }
+        }
+        encodeInteger(out, 0x00, 7, string.length());
+        if (string instanceof AsciiString) {
+            // Fast-path
+            AsciiString asciiString = (AsciiString) string;
+            out.writeBytes(asciiString.array(), asciiString.arrayOffset(), asciiString.length());
+        } else {
+            // Only ASCII is allowed in http2 headers, so it is fine to use this.
+            // https://tools.ietf.org/html/rfc7540#section-8.1.2
+            out.writeCharSequence(string, CharsetUtil.ISO_8859_1);
         }
     }
 
@@ -355,6 +376,51 @@ final class HpackEncoder {
             encodeStringLiteral(out, name);
         }
         encodeStringLiteral(out, value);
+    }
+
+    private boolean canIndexName(CharSequence name, int nameHash) {
+        // Existing dynamic names do not add a NameEntry. Do not retain the entry itself:
+        // ensureCapacity may evict it before encodeAndAddEntries looks up the name again.
+        int length = 0;
+        for (NameEntry e = nameEntries[bucket(nameHash)]; e != null; e = e.next) {
+            if (e.hash == nameHash && equalsVariableTime(name, e.name)) {
+                return true;
+            }
+            ++length;
+        }
+        return length < MAX_LARGE_TABLE_CHAIN_LENGTH;
+    }
+
+    private void growBuckets(int tableSize) {
+        // All large tables use the same mixed hash. Subsequent growth only splits buckets,
+        // so it cannot merge collision chains admitted under the large-table limit.
+        int capacity = max(256, findNextPositivePowerOfTwo((tableSize + 63) / 64));
+        if (capacity <= nameEntries.length) {
+            return;
+        }
+        NameEntry[] oldNames = nameEntries;
+        nameEntries = new NameEntry[capacity];
+        nameValueEntries = new NameValueEntry[capacity];
+        hashMask = (short) (capacity - 1);
+        for (NameEntry entry : oldNames) {
+            while (entry != null) {
+                NameEntry next = entry.next;
+                int bucket = bucket(entry.hash);
+                entry.next = nameEntries[bucket];
+                nameEntries[bucket] = entry;
+                entry = next;
+            }
+        }
+        // Iterate oldest to newest to preserve the newest-first collision chains. Counters and
+        // eviction links are unchanged, including when the counter has wrapped around.
+        for (NameValueEntry entry = head.after; entry != null; entry = entry.after) {
+            int bucket = bucket(entry.hash);
+            entry.next = nameValueEntries[bucket];
+            nameValueEntries[bucket] = entry;
+        }
+        // Never shrink buckets: SETTINGS churn must not cause repeated allocation/rehashing.
+        // A chain inherited from a small table can exceed the large-table admission limit,
+        // but cannot grow further until eviction brings it below that limit.
     }
 
     private int getNameIndex(CharSequence name) {
@@ -402,17 +468,21 @@ final class HpackEncoder {
     }
 
     /**
-     * Returns the header entry with the lowest index value for the header field. Returns null if
-     * header field is not in the dynamic table.
+     * Returns the wire index for a matching header, or the bitwise complement of the chain length
+     * on a miss. This lets admission reuse the lookup traversal without allocating a result object.
      */
-    private NameValueEntry getEntryInsensitive(CharSequence name, int nameHash, CharSequence value, int valueHash) {
+    private int getEntryInsensitive(CharSequence name, int nameHash, CharSequence value, int valueHash) {
         int h = hash(nameHash, valueHash);
+        int length = 0;
         for (NameValueEntry e = nameValueEntries[bucket(h)]; e != null; e = e.next) {
             if (e.hash == h && equalsVariableTime(value, e.value) && equalsVariableTime(name, e.name)) {
-                return e;
+                return getIndexPlusOffset(e.counter);
             }
+            // An inherited small-table chain can exceed the admission limit. Search all of it
+            // so existing entries remain indexable, even beyond that limit.
+            ++length;
         }
-        return null;
+        return ~length;
     }
 
     /**
@@ -519,7 +589,17 @@ final class HpackEncoder {
      * Returns the bucket of the hash table for the hash code h.
      */
     private int bucket(int h) {
-        return h & hashMask;
+        // Keep this helper small enough to inline even at cold lookup/eviction call sites.
+        // All allocated arrays use mixed hashing, including small arrays.
+        // SETTINGS changes to the table's byte limit do not change this mapping.
+        return (hashMask <= 0 ? h : mixHash(h)) & hashMask;
+    }
+
+    private static int mixHash(int h) {
+        // AsciiString's low hash bits alone distribute short, sequential values poorly.
+        h ^= h >>> 16;
+        h *= 0x85ebca6b;
+        return h ^ h >>> 13;
     }
 
     private static int hash(int nameHash, int valueHash) {
