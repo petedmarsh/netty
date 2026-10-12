@@ -18,18 +18,23 @@ package io.netty.handler.codec.http2;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.HttpHeaderValidationUtil;
+import io.netty.util.AsciiString;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
+import java.lang.reflect.Method;
+import java.util.HashSet;
 import java.util.Random;
+import java.util.Set;
 
 import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_HEADER_LIST_SIZE;
 import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_HEADER_TABLE_SIZE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 public class HpackEncoderTest {
@@ -89,6 +94,71 @@ public class HpackEncoderTest {
         encoder = new HpackEncoder(false, 128, HpackEncoder.HUFF_CODE_THRESHOLD);
         encoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         assertEquals(128 * 64, encoder.getMaxHeaderTableSize());
+    }
+
+    @Test
+    public void testBucketMixesHighBitsWithoutChangingTableCap() throws Exception {
+        Method bucket = HpackEncoder.class.getDeclaredMethod("bucket", int.class);
+        bucket.setAccessible(true);
+        for (int hint : new int[] { 2, 16, 64, 128, Integer.MAX_VALUE }) {
+            HpackEncoder encoder = new HpackEncoder(false, hint, HpackEncoder.HUFF_CODE_THRESHOLD);
+            int buckets = Math.min(hint, 128);
+            int mask = buckets - 1;
+            encoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+            assertEquals(buckets * 64, encoder.getMaxHeaderTableSize());
+            Set<Integer> occupied = new HashSet<Integer>();
+            // A deliberately low-bit-colliding synthetic corpus, not a real-traffic distribution claim.
+            for (int i = 0; i < 1024; ++i) {
+                int hash = i << 16;
+                assertEquals(0, hash & mask);
+                int mixed = hash ^ hash >>> 16;
+                mixed *= 0x85ebca6b;
+                int actual = (Integer) bucket.invoke(encoder, hash);
+                assertEquals((mixed ^ mixed >>> 13) & mask, actual);
+                occupied.add(actual);
+            }
+            assertTrue(occupied.size() > buckets / 2);
+            for (int hash : new int[] { -1, Integer.MIN_VALUE, Integer.MAX_VALUE }) {
+                int mixed = hash ^ hash >>> 16;
+                mixed *= 0x85ebca6b;
+                assertEquals((mixed ^ mixed >>> 13) & mask, (int) (Integer) bucket.invoke(encoder, hash));
+            }
+        }
+    }
+
+    @Test
+    public void testEqualFullHashCollisionsRoundTripThroughEviction() throws Http2Exception {
+        // ASCII hashing discards these differing bits. Mixing cannot separate equal full hashes.
+        AsciiString firstName = AsciiString.cached("x-q");
+        AsciiString secondName = AsciiString.cached("x-1");
+        AsciiString firstValue = AsciiString.cached("A");
+        AsciiString secondValue = AsciiString.cached("a");
+        assertEquals(firstName.hashCode(), secondName.hashCode());
+        assertEquals(firstValue.hashCode(), secondValue.hashCode());
+        hpackEncoder.setMaxHeaderTableSize(256);
+        hpackDecoder.setMaxHeaderTableSize(256);
+        for (int round = 0; round < 4; ++round) {
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                Http2Headers input = new DefaultHttp2Headers()
+                        .add(firstName, firstValue).add(secondName, secondValue)
+                        .add(firstName, secondValue).add(secondName, firstValue);
+                assertRoundTrip(input);
+            }
+            // Evict the colliding entries, exercising removal from both bucket chains.
+            for (int i = 0; i < 8; ++i) {
+                assertRoundTrip(new DefaultHttp2Headers().add("x-evict-" + i, "value"));
+            }
+            assertTrue(hpackEncoder.size() <= 256);
+        }
+    }
+
+    private void assertRoundTrip(Http2Headers input) throws Http2Exception {
+        buf.clear();
+        hpackEncoder.encodeHeaders(0, buf, input, Http2HeadersEncoder.NEVER_SENSITIVE);
+        Http2Headers output = new DefaultHttp2Headers();
+        hpackDecoder.decode(0, buf, output, false);
+        assertEquals(input, output);
+        assertEquals(0, buf.readableBytes());
     }
 
     @Test

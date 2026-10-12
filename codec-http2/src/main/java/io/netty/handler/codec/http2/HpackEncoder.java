@@ -519,7 +519,9 @@ final class HpackEncoder {
      * Returns the bucket of the hash table for the hash code h.
      */
     private int bucket(int h) {
-        return h & hashMask;
+        h ^= h >>> 16;
+        h *= 0x85ebca6b;
+        return (h ^ h >>> 13) & hashMask;
     }
 
     private static int hash(int nameHash, int valueHash) {
