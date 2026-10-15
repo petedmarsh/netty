@@ -69,6 +69,7 @@ final class HpackEncoder {
     // a hash map of header fields keyed by header name and value
     private final NameValueEntry[] nameValueEntries;
 
+    private static final int MAX_LOCAL_TABLE_SIZE = 64 * 1024;
     // Small tables retain the original implicit bound (at most 128 entries). Large-table
     // admission never extends a bucket beyond 16; inherited longer chains only drain.
     private static final int MAX_LARGE_TABLE_CHAIN_LENGTH = 16;
@@ -79,7 +80,7 @@ final class HpackEncoder {
     private NameValueEntry latest = head;
 
     private final HpackHuffmanEncoder hpackHuffmanEncoder = new HpackHuffmanEncoder();
-    private final byte hashMask;
+    private final short hashMask;
     private final boolean ignoreMaxHeaderListSize;
     private final int huffCodeThreshold;
     private long size;
@@ -107,17 +108,42 @@ final class HpackEncoder {
      * Creates a new encoder.
      */
     HpackEncoder(boolean ignoreMaxHeaderListSize, int arraySizeHint, int huffCodeThreshold) {
+        this(ignoreMaxHeaderListSize, arraySizeHint, huffCodeThreshold, 128);
+    }
+
+    private HpackEncoder(boolean ignoreMaxHeaderListSize, int arraySizeHint, int huffCodeThreshold, int maxBuckets) {
         this.ignoreMaxHeaderListSize = ignoreMaxHeaderListSize;
         maxHeaderTableSize = DEFAULT_HEADER_TABLE_SIZE;
         maxHeaderListSize = MAX_HEADER_LIST_SIZE;
-        // Enforce a bound of [2, 128] because hashMask is a byte. The max possible value of hashMask is one less
-        // than the length of this array, and we want the mask to be > 0. There is also simply an
-        // upper limit on how many entries can be safely held, as nameEntries will have duplicate
-        // entries every time a header name is used, and thus form a long collision chain.
-        nameEntries = new NameEntry[findNextPositivePowerOfTwo(max(2, min(arraySizeHint, 128)))];
+        // Preserve upstream allocation and raw bucket mapping until SETTINGS requires growth.
+        nameEntries = new NameEntry[findNextPositivePowerOfTwo(max(2, min(arraySizeHint, maxBuckets)))];
         nameValueEntries = new NameValueEntry[nameEntries.length];
-        hashMask = (byte) (nameEntries.length - 1);
+        hashMask = (short) (nameEntries.length - 1);
         this.huffCodeThreshold = huffCodeThreshold;
+    }
+
+    private HpackEncoder(HpackEncoder source, int buckets) {
+        this(source.ignoreMaxHeaderListSize, buckets, source.huffCodeThreshold, 1024);
+        maxHeaderTableSize = source.maxHeaderTableSize;
+        maxHeaderListSize = source.maxHeaderListSize;
+        pendingHeaderTableSizeUpdate = source.pendingHeaderTableSizeUpdate;
+        pendingMinHeaderTableSize = source.pendingMinHeaderTableSize;
+        // Clone oldest first, prepending hash links while appending FIFO links. Never mutate
+        // source nodes: the previous encoder remains independently usable if construction fails.
+        for (NameValueEntry entry = source.head.after; entry != null; entry = entry.after) {
+            int bucket = bucket(entry.hash);
+            NameValueEntry copy = new NameValueEntry(entry.hash, entry.name, entry.value,
+                    entry.counter, nameValueEntries[bucket]);
+            nameValueEntries[bucket] = copy;
+            latest.after = copy;
+            latest = copy;
+        }
+        for (NameEntry first : source.nameEntries) {
+            for (NameEntry entry = first; entry != null; entry = entry.next) {
+                addNameEntry(entry.name, entry.hash, entry.counter);
+            }
+        }
+        size = source.size;
     }
 
     /**
@@ -254,26 +280,27 @@ final class HpackEncoder {
     }
 
     /**
-     * Set the maximum table size. Callers must retain the returned encoder so that
-     * a future implementation can replace its fixed-capacity storage during configuration.
+     * Set the maximum table size, returning a replacement when the final buckets must grow.
+     * Callers must retain the returned encoder. Bucket capacity never shrinks.
      */
     public HpackEncoder withMaxHeaderTableSize(long maxHeaderTableSize) throws Http2Exception {
         if (maxHeaderTableSize < MIN_HEADER_TABLE_SIZE || maxHeaderTableSize > MAX_HEADER_TABLE_SIZE) {
             throw connectionError(PROTOCOL_ERROR, "Header Table Size must be >= %d and <= %d but was %d",
               MIN_HEADER_TABLE_SIZE, MAX_HEADER_TABLE_SIZE, maxHeaderTableSize);
         }
-        // While the receiver may allow a larger table, it is important to cap the local impact of
-        // hash collisions and memory use. This allows the default 4 KiB table when using the
-        // default 64 arraySizeHint.
-        maxHeaderTableSize = Math.min(maxHeaderTableSize, nameEntries.length * 64);
+        // Bound memory independently of both the peer's limit and the initial bucket hint.
+        maxHeaderTableSize = Math.min(maxHeaderTableSize, MAX_LOCAL_TABLE_SIZE);
         if (this.maxHeaderTableSize == maxHeaderTableSize) {
             return this;
         }
-        this.pendingHeaderTableSizeUpdate = true;
-        this.pendingMinHeaderTableSize = Math.min(this.pendingMinHeaderTableSize, maxHeaderTableSize);
-        this.maxHeaderTableSize = maxHeaderTableSize;
-        ensureCapacity(0);
-        return this;
+        int buckets = maxHeaderTableSize <= DEFAULT_HEADER_TABLE_SIZE ? nameEntries.length :
+                findNextPositivePowerOfTwo((int) ((maxHeaderTableSize + 63) / 64));
+        HpackEncoder encoder = buckets > nameEntries.length ? new HpackEncoder(this, buckets) : this;
+        encoder.pendingHeaderTableSizeUpdate = true;
+        encoder.pendingMinHeaderTableSize = Math.min(encoder.pendingMinHeaderTableSize, maxHeaderTableSize);
+        encoder.maxHeaderTableSize = maxHeaderTableSize;
+        encoder.ensureCapacity(0);
+        return encoder;
     }
 
     /**
