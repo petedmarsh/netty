@@ -69,6 +69,10 @@ final class HpackEncoder {
     // a hash map of header fields keyed by header name and value
     private final NameValueEntry[] nameValueEntries;
 
+    // Small tables retain the original implicit bound (at most 128 entries). Large-table
+    // admission never extends a bucket beyond 16; inherited longer chains only drain.
+    private static final int MAX_LARGE_TABLE_CHAIN_LENGTH = 16;
+
     private final NameValueEntry head = new NameValueEntry(-1, AsciiString.EMPTY_STRING,
       AsciiString.EMPTY_STRING, Integer.MAX_VALUE, null);
 
@@ -213,6 +217,11 @@ final class HpackEncoder {
                 // Section 6.1. Indexed Header Field Representation
                 encodeInteger(out, 0x80, 7, staticTableIndex);
             } else {
+                // Check before eviction: rejected large-table insertions must not disturb retained entries.
+                if (maxHeaderTableSize > DEFAULT_HEADER_TABLE_SIZE && !canIndex(name, nameHash, valueHash)) {
+                    encodeLiteral(out, name, value, IndexType.NONE, getNameIndex(name));
+                    return;
+                }
                 ensureCapacity(headerSize);
                 encodeAndAddEntries(out, name, nameHash, value, valueHash);
                 size += headerSize;
@@ -357,6 +366,28 @@ final class HpackEncoder {
             encodeStringLiteral(out, name);
         }
         encodeStringLiteral(out, value);
+    }
+
+    private boolean canIndex(CharSequence name, int nameHash, int valueHash) {
+        int length = 0;
+        for (NameValueEntry e = nameValueEntries[bucket(hash(nameHash, valueHash))]; e != null; e = e.next) {
+            if (++length >= MAX_LARGE_TABLE_CHAIN_LENGTH) {
+                return false;
+            }
+        }
+        if (HpackStaticTable.getIndex(name) != HpackStaticTable.NOT_FOUND) {
+            return true;
+        }
+        length = 0;
+        for (NameEntry e = nameEntries[bucket(nameHash)]; e != null; e = e.next) {
+            // Reusing a name does not extend its chain. Look through inherited small-table chains
+            // too; they are bounded by small-table occupancy, but may exceed the admission limit.
+            if (e.hash == nameHash && equalsConstantTime(name, e.name) != 0) {
+                return true;
+            }
+            ++length;
+        }
+        return length < MAX_LARGE_TABLE_CHAIN_LENGTH;
     }
 
     private int getNameIndex(CharSequence name) {
