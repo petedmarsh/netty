@@ -97,13 +97,13 @@ public class HpackUtilBenchmark extends AbstractMicrobenchmark {
         return ConstantTimeUtils.equalsConstantTime(s1, s2) != 0;
     }
 
-    static HpackEncoder newTestEncoder() {
-        HpackEncoder hpackEncoder = new HpackEncoder();
+    static DefaultHttp2HeadersEncoder newTestEncoder(Http2HeadersEncoder.SensitivityDetector sensitivity) {
+        DefaultHttp2HeadersEncoder hpackEncoder = new DefaultHttp2HeadersEncoder(sensitivity, false);
         ByteBuf buf = Unpooled.buffer();
         try {
-            hpackEncoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
-            hpackEncoder.setMaxHeaderListSize(MAX_HEADER_LIST_SIZE);
-            hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
+            hpackEncoder.configuration().maxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+            hpackEncoder.configuration().maxHeaderListSize(MAX_HEADER_LIST_SIZE);
+            hpackEncoder.encodeHeaders(0, EmptyHttp2Headers.INSTANCE, buf);
         } catch (Http2Exception e) {
             throw new Error("max size not allowed?", e);
         } finally  {

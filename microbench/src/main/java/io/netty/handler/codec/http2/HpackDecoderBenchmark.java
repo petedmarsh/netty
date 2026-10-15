@@ -85,12 +85,11 @@ public class HpackDecoderBenchmark extends AbstractMicrobenchmark {
     }
 
     private byte[] getSerializedHeaders(Http2Headers headers, boolean sensitive) throws Http2Exception {
-        HpackEncoder hpackEncoder = HpackUtilBenchmark.newTestEncoder();
+        DefaultHttp2HeadersEncoder hpackEncoder = HpackUtilBenchmark.newTestEncoder(
+                sensitive ? Http2HeadersEncoder.ALWAYS_SENSITIVE : Http2HeadersEncoder.NEVER_SENSITIVE);
         ByteBuf out = size.newOutBuffer();
         try {
-            hpackEncoder.encodeHeaders(3 /* randomly chosen */, out, headers,
-                                  sensitive ? Http2HeadersEncoder.ALWAYS_SENSITIVE
-                                            : Http2HeadersEncoder.NEVER_SENSITIVE);
+            hpackEncoder.encodeHeaders(3 /* randomly chosen */, headers, out);
             byte[] bytes = new byte[out.readableBytes()];
             out.readBytes(bytes);
             return bytes;

@@ -55,7 +55,7 @@ public class HpackEncoderTest {
     public void testSetMaxHeaderTableSizeToMaxValue() throws Http2Exception {
         hpackEncoder = new HpackEncoder(
             false, Integer.MAX_VALUE, HpackEncoder.HUFF_CODE_THRESHOLD);
-        hpackEncoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         hpackDecoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         hpackDecoder.decode(0, buf, mockHeaders, true);
@@ -64,7 +64,7 @@ public class HpackEncoderTest {
 
     @Test
     public void testSetMaxHeaderTableSizeBelowCap() throws Http2Exception {
-        hpackEncoder.setMaxHeaderTableSize(2048);
+        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(2048);
         hpackDecoder.setMaxHeaderTableSize(2048);
         hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         hpackDecoder.decode(0, buf, mockHeaders, true);
@@ -72,7 +72,7 @@ public class HpackEncoderTest {
         assertEquals(2048, hpackDecoder.getMaxHeaderTableSize());
 
         buf.clear();
-        hpackEncoder.setMaxHeaderTableSize(0);
+        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(0);
         hpackDecoder.setMaxHeaderTableSize(0);
         hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         hpackDecoder.decode(0, buf, mockHeaders, true);
@@ -83,12 +83,19 @@ public class HpackEncoderTest {
     @Test
     public void testSetMaxHeaderTableSizeCapScalesWithSizeHint() throws Http2Exception {
         HpackEncoder encoder = new HpackEncoder(false, 16, HpackEncoder.HUFF_CODE_THRESHOLD);
-        encoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+        encoder = encoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         assertEquals(16 * 64, encoder.getMaxHeaderTableSize());
 
         encoder = new HpackEncoder(false, 128, HpackEncoder.HUFF_CODE_THRESHOLD);
-        encoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+        encoder = encoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         assertEquals(128 * 64, encoder.getMaxHeaderTableSize());
+    }
+
+    @Test
+    public void testConfigurationWithoutGrowthRetainsEncoder() throws Http2Exception {
+        Assertions.assertSame(hpackEncoder, hpackEncoder.withMaxHeaderTableSize(4096));
+        Assertions.assertSame(hpackEncoder, hpackEncoder.withMaxHeaderTableSize(2048));
+        Assertions.assertSame(hpackEncoder, hpackEncoder.withMaxHeaderTableSize(0));
     }
 
     @Test
@@ -96,7 +103,7 @@ public class HpackEncoderTest {
         assertThrows(Http2Exception.class, new Executable() {
             @Override
             public void execute() throws Throwable {
-                hpackEncoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE + 1);
+                hpackEncoder = hpackEncoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE + 1);
             }
         });
     }
@@ -313,7 +320,7 @@ public class HpackEncoderTest {
     }
 
     private void setMaxTableSize(int maxHeaderTableSize) throws Http2Exception {
-        hpackEncoder.setMaxHeaderTableSize(maxHeaderTableSize);
+        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(maxHeaderTableSize);
         hpackDecoder.setMaxHeaderTableSize(maxHeaderTableSize);
     }
 

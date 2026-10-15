@@ -103,9 +103,9 @@ public class HpackEncoderBenchmark extends AbstractMicrobenchmark {
     @Benchmark
     @BenchmarkMode(Mode.AverageTime)
     public void encode(Blackhole bh) throws Exception {
-        HpackEncoder hpackEncoder = HpackUtilBenchmark.newTestEncoder();
+        DefaultHttp2HeadersEncoder hpackEncoder = HpackUtilBenchmark.newTestEncoder(sensitivityDetector);
         output.clear();
-        hpackEncoder.encodeHeaders(3 /*randomly chosen*/, output, http2Headers, sensitivityDetector);
+        hpackEncoder.encodeHeaders(3 /*randomly chosen*/, http2Headers, output);
         bh.consume(output);
     }
 }
