@@ -1,0 +1,170 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'"><title>HPACK in-place growth — current measured report</title><style>body{font:16px/1.6 system-ui,sans-serif;color:#173450;background:#f7f9fc;margin:0}main{max-width:1200px;margin:auto;padding:32px}h1,h2{line-height:1.2}h2{margin-top:2.5rem}a{color:#145b99}p{max-width:100ch}table{border-collapse:collapse;font-size:14px;width:100%}td,th{border:1px solid #ccd5df;padding:8px;text-align:left}th{background:#e8eff8}.scroll{overflow-x:auto}pre{overflow:auto;background:#e8eff8;padding:16px}svg{width:100%;height:auto}nav{padding:16px;background:#e8eff8}</style></head><body><main><nav><a href="#architecture">How growth works</a> · <a href="#exhaustive">All measured comparisons</a> · <a href="hpack-inplace-evidence.tar.gz">Portable evidence</a> · <a href="hpack-64k-series.html">Historical stages</a></nav><h1 id="current-hpack-in-place-growth-current-follow-up">HPACK in-place growth: current follow-up</h1>
+<p>This is the current follow-up to the <a href="hpack-64k-series.html">historical three-stage report</a>, whose comparisons remain pinned to their original stages. <a href="hpack-inplace.html">Open the self-contained HTML report</a>. <a href="hpack-inplace-comparisons.md">Exhaustive comparisons</a> include every browser, synthetic and initialization cell, allocation and paired confidence interval. <a href="hpack-inplace-evidence.tar.gz">Portable raw evidence</a> includes commands, logs, source snapshots, provenance and hash manifests.</p>
+<h2 id="current-why-keep-the-encoder-object">Why keep the encoder object?</h2>
+<p>The motivating common case is initial peer SETTINGS, before headers have populated the encoder. An empty default-4K encoder configured to 64K needs larger lookup arrays, not a replacement encoder, sentinel, Huffman helper and copied state. The new void setter keeps the encoder identity stable and the wrapper reference final. This is a startup optimization, not a claim that late populated growth is common or faster.</p>
+<p>The rarer populated-growth path retains existing nodes. Both new arrays are allocated before any links change; rehashing uses cached hashes (no user CharSequence callbacks). The two bucket-array fields and short mask are non-final. Only hash-chain next links change: FIFO after links, entry counters and name representatives are untouched. FIFO eviction and HPACK indexing are unchanged. High-water arrays are reused after shrink; shrinking can still evict entries as required by capacity.</p>
+<p>Raw hash mapping, bounded admission, collision policy and sensitivity/security behavior are unchanged. This does not make sensitive headers safe to index: callers must still identify them. 64K capacity remains possible, but poor admission under hostile/skewed distributions can underfill it; capacity is not a promise of occupancy or compression. Existing runtime proofs measured exactly 64,887 bytes / 1120 entries, max chain 7 and max dynamic index 1181 in both tested distributions. Those observations are not a universal guarantee.</p>
+<h2 id="current-measured-answer-not-a-parity-claim">Measured answer, not a parity claim</h2>
+<p>64K initialization: replacement → inplace <strong>374.145 → 334.628 ns per encoder</strong>, and <strong>9192 → 8992 B per encoder</strong>. Paired timing delta −39.516 ns, 95% CI [−46.057, −32.976]; allocation delta about −200 B. Initialization includes construction and empty configuration, not populated growth latency. Upstream was not measured at 64K because it does not support it.</p>
+<p>4K initialization: upstream / replacement / inplace <strong>36.088 / 36.419 / 38.172 ns per encoder</strong>, approximately <strong>768 B in all three</strong>. All 54 timing CIs at 4K cross zero. This is inconclusive, NOT parity, equivalence or non-inferiority: there was no predeclared NI margin. Meaningful slowdowns remain possible. No outliers are hidden or removed. See especially new NORMAL/NEVER (633.190 / 927.691 / 1210.756 ns) and CHURN (1540.779 / 1512.810 / 1653.074 ns), plus the 64K persistent counterexamples in the exhaustive tables.</p>
+<p>Units: browser ns and B are <strong>per request/header block</strong> (already normalized over 64 blocks; do not divide again); synthetic is <strong>per four-field block</strong>; initialization is <strong>per encoder</strong>. NEVER is primary, INDEX_COOKIES supporting. No pooled cell average is used. The shared-host campaign has 384 forks and 1920 measurement iterations, not 1920 independent samples. Paired-t CIs are pointwise, unadjusted and descriptive; multiplicity and host variability limit generalization.</p>
+<h2 id="current-evidence-and-verification-scope">Evidence and verification scope</h2>
+<p>The six codec/test files exactly match the frozen source proof; benchmark sources are unchanged. Preserved current-source test logs report focused 148 tests, zero failures/errors/skips; full paranoid HTTP/2 1664 tests, zero failures/errors, 5 skips. These are existing runs, not fresh executions during documentation finalization. Earlier failures are preserved alongside corrected successful logs.</p>
+<p>The archive excludes jars, classes, Maven repositories and caches, preserves original bytes and absolute-path provenance, and carries a deterministic content manifest plus omitted-binary hashes. The portable verifier validates the archive manifest, chained ledger/raw hashes and independently recalculates all 126 paired comparisons. The original full offline analysis additionally requires original binaries, external frozen paths and precommit git identity; it is not made self-contained by omitting those binaries. No production rebuild or new timing run was performed.</p>
+<p>Decompressed archive security review found synthetic fixture credential markers (SYNTHETIC_NOT_A_CREDENTIAL_), literal test secrets and redacted probe values, not actual credentials. Local paths and command provenance are intentionally retained. No claim is made that a heuristic scan proves absence of every possible secret.</p>
+<p>HTML checks are static: generated table fidelity, unique anchors, local links, no external resources or scripts. There is no browser visual-validation claim (macOS sandbox constraints).</p>
+<h2 id="current-reproduce-without-a-benchmark-run">Reproduce without a benchmark run</h2>
+<p>From the worktree root, using Python 3 standard library only:</p>
+<pre><code>
+python3 -B docs/hpack-inplace-tools/verify.py docs/hpack-inplace-evidence.tar.gz
+
+python3 -B docs/hpack-inplace-tools/security.py docs/hpack-inplace-evidence.tar.gz
+
+python3 -B docs/hpack-inplace-tools/render.py
+
+</code></pre>
+<p>To recreate the deterministic archive from the original evidence directory (not required to read or verify it):</p>
+<pre><code>
+python3 -B docs/hpack-inplace-tools/package.py ../hpack-inplace-evidence
+
+</code></pre>
+<p>Two packaging passes must yield identical SHA256. Run <code>git diff --check</code> and <code>git diff --cached --check</code> without whitespace exemptions; immutable raw log/JSON bytes remain inside the archive rather than being normalized. Original commands for each fork are recorded in schedule.json and ledger.jsonl within the archive.</p>
+<p>Archive: <strong>3276094 bytes</strong>, SHA256 <code>197d79caf8034d3446924e0ff432b4e7f15fcb79850c4eb954f07ddcea3049a0</code>.</p><section id="architecture"><h2>One stable object, new lookup arrays</h2><p>Source-only architecture diagram, not a heap measurement. In both cases FIFO means oldest entries leave first.</p>
+<svg viewBox="0 0 900 360" role="img" aria-labelledby="diagram-title diagram-desc" xmlns="http://www.w3.org/2000/svg">
+<title id="diagram-title">Old replacement versus new in-place growth</title><desc id="diagram-desc">Old wrapper switches to a new encoder with new arrays and copied nodes. New final wrapper reference keeps the same encoder, allocates both arrays, and relinks hash chains on existing nodes. FIFO after links remain unchanged.</desc>
+<g fill="#e8eff8" stroke="#38628c" stroke-width="2"><rect x="10" y="45" width="420" height="120" rx="12"/><rect x="460" y="45" width="430" height="120" rx="12"/><rect x="10" y="215" width="420" height="120" rx="12"/><rect x="460" y="215" width="430" height="120" rx="12"/></g>
+<g fill="#173450" font-family="system-ui,sans-serif" font-size="18"><text x="20" y="26">OLD: replacement-return API</text><text x="30" y="77">wrapper → encoder A + old arrays</text><text x="30" y="110">growth: allocate encoder B + arrays</text><text x="30" y="143">copy nodes/state; switch wrapper → B</text><text x="480" y="77">FIFO copied oldest → newest</text><text x="480" y="110">old object is not the new object</text><text x="480" y="143">extra startup objects / copying</text><text x="20" y="196">NEW: void setter; stable identity</text><text x="30" y="247">final wrapper → same encoder A</text><text x="30" y="280">allocate BOTH arrays before relinking</text><text x="30" y="313">publish arrays + mutable short mask</text><text x="480" y="247">existing nodes: cached hash → bucket</text><text x="480" y="280">hash next links change; no callbacks</text><text x="480" y="313">FIFO after links / counters untouched</text></g></svg></section><section id="exhaustive"><h1 id="results-complete-in-place-hpack-campaign-audited-results">Complete in-place HPACK campaign — audited results</h1>
+<h2 id="results-answer">Answer</h2>
+<p><strong>64K initialization improved; universal 4K preservation/improvement is not established.</strong> The stable void setter reduces 64K initialization from 374.145 to 334.628 ns/op (−39.516 ns, 95% paired CI [−46.057, −32.976], −10.562%) and allocation from 9192.000152 to 8992.000136 B/op (−200.000016 B, CI [−200.000018, −200.000013], −2.176%). These are pointwise significant versus replacement; upstream does not support 64K and was not measured there.</p>
+<p>At 4K all 54 timing contrasts (18 cells × three comparisons) include zero. This means no detected timing improvement/regression, NOT equivalence or non-inferiority. The frozen plan has no non-inferiority margin or decision rule; no NI pass count is justified. Broad uncertainty leaves meaningful slowdowns possible. 4K init is 36.088 / 36.419 / 38.172 ns/op (upstream / replacement / inplace), with about 768 B/op in all three.</p>
+<h2 id="results-audit-and-provenance">Audit and provenance</h2>
+<p>- COMPLETE: 384 unique scheduled forks, 324 at 4K + 48 browser at 64K + 12 initialization at 64K; all completed once, exit 0. 1920 measurement iterations, averaged within forks (not 1920 independent samples).</p>
+<p>- 1536 hash-chained events: exactly preflight/start/process-finished/parsed per scheduled fork, in schedule order; 768 raw hashes = 384 JSON + 384 logs. No orphan or missing raw file. All preflights report no competing JMH JVM, but the host was shared, not isolated.</p>
+<p>- All 811 readiness inventory inputs unchanged; freeze.json contains <strong>812 entries</strong>, because freeze adds schedule.json. Candidate HEAD and exact protected git patch rechecked; all 12 protected source hashes, three jar identities, six fixture sources/48 nested/generated classes, and five candidate production class hashes verified offline. Broader historical hash-verification reports 77 HPACK benchmark classes.</p>
+<p>- 126 comparison rows independently recalculated from raw JSON and matched against both comparisons.csv and summary.json; all 384 raw-forks.csv records matched. All 67 exact-wire rows match readiness and wire.csv: 24 browser + 27 synthetic at 4K, 16 browser at 64K. Matched wire lengths/hashes and requested/actual capacity checked by the read-only readiness gate.</p>
+<p>- Existing reviewed focused tests: 148, 0 failures/errors/skips. Full paranoid HTTP/2: 1664, 0 failures/errors, 5 skips. Package history: success, focused tests enabled. These are preserved historical results, NOT new test executions. Original probe/test failures remain preserved, followed by corrected successful evidence.</p>
+<p>- Candidate jar SHA256: <code>c5f0f55d8471f8ba2f0656846a57d61ad74a2066037102bea4c1f1bd6cc80640</code>. Candidate base <code>7369225ffe91d9afd75a5b168c1687ef3a96f71f</code> plus frozen protected patch (not a clean committed identity).</p>
+<p>- No timing, tests, builds, Java probes, source edits, commit or push in this audit. Existing artifacts are hashed before/after and preserved. Only analysis-audit.py/json, analysis-comparisons.csv and this report are added.</p>
+<h2 id="results-source-change-and-functional-scope">Source change and functional scope</h2>
+<p>Two production files replace the replacement-return API/copy constructor with void setMaxHeaderTableSize and a final wrapper encoder reference. Mutable bucket arrays/short mask grow at their high-water mark; both arrays are allocated before relinking existing nodes via cached hashes. FIFO links, counters, representatives, raw hash/admission/collision policy and pending minimum behavior are retained. Four test/support files adapt callers and cover empty/populated growth, identity, cached hash/counters, validation, eviction/indexing and high-water reuse. No benchmark source change.</p>
+<p>Existing runtime proof: root identity stable for inplace, replaced for old implementation; empty and populated arrays grow 64→1024. Populated proof retains 50 pair and 10 name nodes, 2240 bytes. Both implementations retain 64,887 bytes/1120 entries with max chain 7 and max dynamic index 1181 in both tested distributions. Initial encoder root is 72 bytes, reachable graph 2160 bytes/13 objects for all three; graph footprint is not allocation per operation.</p>
+<h2 id="results-method-and-notation">Method and notation</h2>
+<p>U = unchanged upstream; O = old replacement implementation; N = new inplace setter. Means are raw ns/op or normalized B/op. Browser operations are already normalized per header block (64 blocks/invocation); do not divide again. Synthetic and initialization retain their fixture operation definitions. NEVER is primary policy; INDEX_COOKIES is supporting, not a substitute.</p>
+<p>For each cell and metric, average five measurements within each fork, pair versions by round, then compute arithmetic differences dᵣ = candidate − reference. CI = mean(d) ± t(.975,n−1)·sd(d)/√n, with n=6/df=5 for all 4K and 64K init, n=3/df=2 for 64K browser; t=2.57058184 and 4.30265273. Negative favors candidate. Percent delta is delta/reference mean, not mean ratios. No pooling across cells, no outlier deletion, no cross-capacity paired claim.</p>
+<p>4K uses each of six three-version permutations once per cell; 64K alternates AB/BA, browser starting sides balance globally (three pairs cannot balance within one cell), initialization has three pairs each direction. Intervals are descriptive, unadjusted pointwise 95% paired-t intervals on a shared host. Distribution/host effects and multiplicity limit generalization. Tiny allocation differences can reflect normalized profiler overhead; near-zero allocation denominators make percent changes misleading.</p>
+<p>Each contrast below is <strong>delta [95% CI low, high]; percent</strong>. Full precision is in analysis-comparisons.csv; very small allocation values use scientific notation rather than rounding away uncertainty.</p>
+<h2 id="results-4k-browser-all-eight-cells-ns-op">4K: browser (all eight cells) — ns/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>U mean</th><th>O mean</th><th>N mean</th><th>N−U [CI]; %</th><th>N−O [CI]; %</th><th>O−U [CI]; %</th></tr>
+<tr><td>new-AUTH-INDEX</td><td>619.759</td><td>1220.901</td><td>653.105</td><td>33.346 [-92.162, 158.854]; +5.380%</td><td>-567.796 [-2043.626, 908.033]; -46.506%</td><td>601.142 [-807.601, 2009.885]; +96.996%</td></tr>
+<tr><td>new-AUTH-NEVER</td><td>726.620</td><td>679.580</td><td>705.730</td><td>-20.890 [-74.615, 32.834]; -2.875%</td><td>26.149 [-40.409, 92.707]; +3.848%</td><td>-47.040 [-167.014, 72.935]; -6.474%</td></tr>
+<tr><td>new-NORMAL-INDEX</td><td>558.819</td><td>759.439</td><td>562.354</td><td>3.536 [-14.587, 21.658]; +0.633%</td><td>-197.085 [-696.733, 302.563]; -25.951%</td><td>200.620 [-316.310, 717.551]; +35.901%</td></tr>
+<tr><td>new-NORMAL-NEVER</td><td>633.190</td><td>927.691</td><td>1210.756</td><td>577.565 [-936.948, 2092.078]; +91.215%</td><td>283.065 [-537.177, 1103.307]; +30.513%</td><td>294.500 [-413.850, 1002.850]; +46.511%</td></tr>
+<tr><td>persistent-AUTH-INDEX</td><td>650.656</td><td>700.330</td><td>667.894</td><td>17.238 [-177.142, 211.619]; +2.649%</td><td>-32.436 [-68.422, 3.551]; -4.631%</td><td>49.674 [-130.845, 230.192]; +7.634%</td></tr>
+<tr><td>persistent-AUTH-NEVER</td><td>1056.415</td><td>673.667</td><td>654.111</td><td>-402.305 [-1428.180, 623.571]; -38.082%</td><td>-19.557 [-52.228, 13.115]; -2.903%</td><td>-382.748 [-1410.513, 645.017]; -36.231%</td></tr>
+<tr><td>persistent-NORMAL-INDEX</td><td>501.706</td><td>504.406</td><td>497.309</td><td>-4.397 [-33.653, 24.859]; -0.876%</td><td>-7.097 [-19.148, 4.954]; -1.407%</td><td>2.700 [-20.628, 26.028]; +0.538%</td></tr>
+<tr><td>persistent-NORMAL-NEVER</td><td>529.204</td><td>578.303</td><td>526.052</td><td>-3.152 [-85.647, 79.342]; -0.596%</td><td>-52.251 [-262.754, 158.252]; -9.035%</td><td>49.099 [-87.694, 185.892]; +9.278%</td></tr>
+</table></div>
+<h2 id="results-4k-browser-all-eight-cells-b-op">4K: browser (all eight cells) — B/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>U mean</th><th>O mean</th><th>N mean</th><th>N−U [CI]; %</th><th>N−O [CI]; %</th><th>O−U [CI]; %</th></tr>
+<tr><td>new-AUTH-INDEX</td><td>151.750</td><td>151.750</td><td>143.750</td><td>-8.000 [-45.919, 29.919]; -5.272%</td><td>-8.000 [-45.920, 29.919]; -5.272%</td><td>0.000244129 [-31.858, 31.859]; +0.000%</td></tr>
+<tr><td>new-AUTH-NEVER</td><td>133.875</td><td>133.875</td><td>133.875</td><td>-8.81599e-06 [-3.18735e-05, 1.42416e-05]; -0.000%</td><td>1.15649e-05 [-1.81375e-05, 4.12674e-05]; +0.000%</td><td>-2.03809e-05 [-7.30337e-05, 3.22719e-05]; -0.000%</td></tr>
+<tr><td>new-NORMAL-INDEX</td><td>138.125</td><td>130.125</td><td>138.125</td><td>2.15986e-06 [-7.37818e-06, 1.16979e-05]; +0.000%</td><td>8.000 [-12.565, 28.564]; +6.148%</td><td>-8.000 [-28.564, 12.565]; -5.792%</td></tr>
+<tr><td>new-NORMAL-NEVER</td><td>134.375</td><td>134.375</td><td>134.375</td><td>0.00020755 [-0.000337999, 0.0007531]; +0.000%</td><td>9.22513e-05 [-0.00018293, 0.000367433]; +0.000%</td><td>0.000115299 [-0.00016136, 0.000391958]; +0.000%</td></tr>
+<tr><td>persistent-AUTH-INDEX</td><td>139.017</td><td>123.017</td><td>99.017</td><td>-40.000 [-60.565, -19.435]; -28.773%</td><td>-24.000 [-51.590, 3.590]; -19.510%</td><td>-16.000 [-42.012, 10.012]; -11.509%</td></tr>
+<tr><td>persistent-AUTH-NEVER</td><td>111.625</td><td>119.625</td><td>119.625</td><td>8.000 [-12.564, 28.564]; +7.167%</td><td>1.89768e-05 [-2.84108e-05, 6.63645e-05]; +0.000%</td><td>8.000 [-12.564, 28.564]; +7.167%</td></tr>
+<tr><td>persistent-NORMAL-INDEX</td><td>114.691</td><td>122.691</td><td>122.691</td><td>8.000 [-12.565, 28.565]; +6.975%</td><td>1.06296e-05 [-8.29597e-06, 2.95551e-05]; +0.000%</td><td>8.000 [-12.565, 28.565]; +6.975%</td></tr>
+<tr><td>persistent-NORMAL-NEVER</td><td>118.000</td><td>118.000</td><td>118.000</td><td>1.40605e-06 [-2.59844e-05, 2.87965e-05]; +0.000%</td><td>-1.86884e-05 [-0.00011263, 7.52534e-05]; -0.000%</td><td>2.00945e-05 [-5.13414e-05, 9.15303e-05]; +0.000%</td></tr>
+</table></div>
+<h2 id="results-4k-synthetic-all-nine-cells-ns-op">4K: synthetic (all nine cells) — ns/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>U mean</th><th>O mean</th><th>N mean</th><th>N−U [CI]; %</th><th>N−O [CI]; %</th><th>O−U [CI]; %</th></tr>
+<tr><td>CHURN</td><td>1540.779</td><td>1512.810</td><td>1653.074</td><td>112.295 [-362.078, 586.668]; +7.288%</td><td>140.264 [-264.763, 545.290]; +9.272%</td><td>-27.969 [-114.681, 58.743]; -1.815%</td></tr>
+<tr><td>COLLISION</td><td>1284.591</td><td>998.401</td><td>1030.744</td><td>-253.846 [-631.336, 123.643]; -19.761%</td><td>32.343 [-43.984, 108.670]; +3.239%</td><td>-286.189 [-620.888, 48.510]; -22.279%</td></tr>
+<tr><td>HUFFMAN</td><td>3680.107</td><td>3424.041</td><td>3526.288</td><td>-153.819 [-754.216, 446.577]; -4.180%</td><td>102.246 [-169.398, 373.890]; +2.986%</td><td>-256.066 [-1005.172, 493.041]; -6.958%</td></tr>
+<tr><td>MIXED</td><td>556.210</td><td>573.030</td><td>562.842</td><td>6.632 [-30.388, 43.652]; +1.192%</td><td>-10.188 [-41.800, 21.424]; -1.778%</td><td>16.820 [-23.506, 57.146]; +3.024%</td></tr>
+<tr><td>NAME_HIT</td><td>874.600</td><td>947.222</td><td>905.395</td><td>30.796 [-24.360, 85.951]; +3.521%</td><td>-41.827 [-189.608, 105.954]; -4.416%</td><td>72.623 [-126.188, 271.433]; +8.304%</td></tr>
+<tr><td>REPEATED</td><td>49.176</td><td>48.722</td><td>49.877</td><td>0.701 [-11.565, 12.966]; +1.425%</td><td>1.154 [-17.699, 20.008]; +2.369%</td><td>-0.454 [-19.602, 18.694]; -0.922%</td></tr>
+<tr><td>SENSITIVE</td><td>54.757</td><td>52.678</td><td>60.951</td><td>6.194 [-7.863, 20.252]; +11.313%</td><td>8.274 [-4.295, 20.842]; +15.706%</td><td>-2.079 [-4.922, 0.763]; -3.797%</td></tr>
+<tr><td>STATIC</td><td>104.898</td><td>85.533</td><td>94.274</td><td>-10.624 [-76.147, 54.898]; -10.128%</td><td>8.741 [-10.438, 27.920]; +10.220%</td><td>-19.365 [-101.216, 62.485]; -18.461%</td></tr>
+<tr><td>WORKING_SET</td><td>818.760</td><td>807.081</td><td>792.527</td><td>-26.233 [-62.729, 10.264]; -3.204%</td><td>-14.554 [-79.028, 49.920]; -1.803%</td><td>-11.679 [-56.059, 32.702]; -1.426%</td></tr>
+</table></div>
+<h2 id="results-4k-synthetic-all-nine-cells-b-op">4K: synthetic (all nine cells) — B/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>U mean</th><th>O mean</th><th>N mean</th><th>N−U [CI]; %</th><th>N−O [CI]; %</th><th>O−U [CI]; %</th></tr>
+<tr><td>CHURN</td><td>336.001</td><td>336.001</td><td>336.001</td><td>2.33223e-05 [-0.000261706, 0.00030835]; +0.000%</td><td>3.60378e-05 [-0.000211659, 0.000283735]; +0.000%</td><td>-1.27156e-05 [-0.000108972, 8.35412e-05]; -0.000%</td></tr>
+<tr><td>COLLISION</td><td>184.001</td><td>160.000</td><td>168.000</td><td>-16.000 [-57.130, 25.129]; -8.696%</td><td>8.000 [-12.565, 28.565]; +5.000%</td><td>-24.000 [-51.591, 3.590]; -13.044%</td></tr>
+<tr><td>HUFFMAN</td><td>208.001</td><td>208.001</td><td>208.001</td><td>-5.60189e-05 [-0.00028499, 0.000172952]; -0.000%</td><td>4.17783e-05 [-6.76007e-05, 0.000151157]; +0.000%</td><td>-9.77972e-05 [-0.000386353, 0.000190758]; -0.000%</td></tr>
+<tr><td>MIXED</td><td>208.000</td><td>208.000</td><td>208.000</td><td>2.8845e-06 [-1.22591e-05, 1.80281e-05]; +0.000%</td><td>-4.09618e-06 [-1.70855e-05, 8.8931e-06]; -0.000%</td><td>6.98069e-06 [-9.44447e-06, 2.34058e-05]; +0.000%</td></tr>
+<tr><td>NAME_HIT</td><td>208.000</td><td>208.000</td><td>208.000</td><td>1.24045e-05 [-9.37214e-06, 3.41812e-05]; +0.000%</td><td>-1.71527e-05 [-7.82965e-05, 4.39912e-05]; -0.000%</td><td>2.95572e-05 [-5.16495e-05, 0.000110764]; +0.000%</td></tr>
+<tr><td>REPEATED</td><td>32.000</td><td>32.000</td><td>24.000</td><td>-8.000 [-57.526, 41.526]; -25.000%</td><td>-8.000 [-34.012, 18.012]; -25.000%</td><td>-5.00476e-07 [-35.619, 35.619]; -0.000%</td></tr>
+<tr><td>SENSITIVE</td><td>48.000</td><td>40.000</td><td>48.000</td><td>2.51837e-06 [-3.19305e-06, 8.22979e-06]; +0.000%</td><td>8.000 [-12.565, 28.565]; +20.000%</td><td>-8.000 [-28.565, 12.565]; -16.667%</td></tr>
+<tr><td>STATIC</td><td>48.000</td><td>48.000</td><td>48.000</td><td>-6.16722e-06 [-3.09926e-05, 1.86582e-05]; -0.000%</td><td>-5.49409e-07 [-8.70439e-06, 7.60557e-06]; -0.000%</td><td>-5.61781e-06 [-3.58942e-05, 2.46586e-05]; -0.000%</td></tr>
+<tr><td>WORKING_SET</td><td>208.000</td><td>208.000</td><td>208.000</td><td>-1.07523e-05 [-2.54526e-05, 3.94802e-06]; -0.000%</td><td>-5.96538e-06 [-3.24715e-05, 2.05407e-05]; -0.000%</td><td>-4.78693e-06 [-2.30612e-05, 1.34873e-05]; -0.000%</td></tr>
+</table></div>
+<h2 id="results-4k-initialization-ns-op">4K: initialization — ns/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>U mean</th><th>O mean</th><th>N mean</th><th>N−U [CI]; %</th><th>N−O [CI]; %</th><th>O−U [CI]; %</th></tr>
+<tr><td>init</td><td>36.088</td><td>36.419</td><td>38.172</td><td>2.084 [-1.237, 5.406]; +5.776%</td><td>1.753 [-2.172, 5.678]; +4.813%</td><td>0.332 [-1.218, 1.881]; +0.919%</td></tr>
+</table></div>
+<h2 id="results-4k-initialization-b-op">4K: initialization — B/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>U mean</th><th>O mean</th><th>N mean</th><th>N−U [CI]; %</th><th>N−O [CI]; %</th><th>O−U [CI]; %</th></tr>
+<tr><td>init</td><td>768.000</td><td>768.000</td><td>768.000</td><td>8.5002e-07 [-4.98035e-07, 2.19808e-06]; +0.000%</td><td>7.17984e-07 [-8.90463e-07, 2.32643e-06]; +0.000%</td><td>1.32037e-07 [-5.14055e-07, 7.78129e-07]; +0.000%</td></tr>
+</table></div>
+<h2 id="results-64k-inplace-versus-replacement-only-browser-all-eight-cells-ns-op">64K — inplace versus replacement only: browser (all eight cells) — ns/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>O mean</th><th>N mean</th><th>N−O [CI]; %</th></tr>
+<tr><td>new-AUTH-INDEX</td><td>516.557</td><td>518.076</td><td>1.519 [-20.962, 23.999]; +0.294%</td></tr>
+<tr><td>new-AUTH-NEVER</td><td>565.994</td><td>559.227</td><td>-6.767 [-16.842, 3.309]; -1.196%</td></tr>
+<tr><td>new-NORMAL-INDEX</td><td>424.547</td><td>414.878</td><td>-9.669 [-53.979, 34.641]; -2.278%</td></tr>
+<tr><td>new-NORMAL-NEVER</td><td>452.844</td><td>451.937</td><td>-0.907 [-15.621, 13.806]; -0.200%</td></tr>
+<tr><td>persistent-AUTH-INDEX</td><td>526.100</td><td>550.488</td><td>24.388 [-53.356, 102.133]; +4.636%</td></tr>
+<tr><td>persistent-AUTH-NEVER</td><td>565.629</td><td>598.386</td><td>32.757 [-111.968, 177.482]; +5.791%</td></tr>
+<tr><td>persistent-NORMAL-INDEX</td><td>395.158</td><td>415.872</td><td>20.714 [-89.356, 130.783]; +5.242%</td></tr>
+<tr><td>persistent-NORMAL-NEVER</td><td>431.368</td><td>424.374</td><td>-6.994 [-28.042, 14.055]; -1.621%</td></tr>
+</table></div>
+<h2 id="results-64k-inplace-versus-replacement-only-browser-all-eight-cells-b-op">64K — inplace versus replacement only: browser (all eight cells) — B/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>O mean</th><th>N mean</th><th>N−O [CI]; %</th></tr>
+<tr><td>new-AUTH-INDEX</td><td>214.250</td><td>211.125</td><td>-3.125 [-3.125, -3.125]; -1.459%</td></tr>
+<tr><td>new-AUTH-NEVER</td><td>209.875</td><td>206.750</td><td>-3.125 [-3.125, -3.125]; -1.489%</td></tr>
+<tr><td>new-NORMAL-INDEX</td><td>242.250</td><td>239.375</td><td>-2.875 [-62.029, 56.279]; -1.187%</td></tr>
+<tr><td>new-NORMAL-NEVER</td><td>256.250</td><td>253.500</td><td>-2.750 [-2.750, -2.750]; -1.073%</td></tr>
+<tr><td>persistent-AUTH-INDEX</td><td>0.000213891</td><td>16.000</td><td>16.000 [-52.842, 84.842]; +7480448.761%</td></tr>
+<tr><td>persistent-AUTH-NEVER</td><td>0.000229916</td><td>16.000</td><td>16.000 [-52.842, 84.843]; +6959076.823%</td></tr>
+<tr><td>persistent-NORMAL-INDEX</td><td>16.000</td><td>48.000</td><td>32.000 [-36.842, 100.842]; +199.998%</td></tr>
+<tr><td>persistent-NORMAL-NEVER</td><td>32.000</td><td>48.000</td><td>16.000 [-52.842, 84.842]; +50.000%</td></tr>
+</table></div>
+<h2 id="results-64k-inplace-versus-replacement-only-initialization-ns-op">64K — inplace versus replacement only: initialization — ns/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>O mean</th><th>N mean</th><th>N−O [CI]; %</th></tr>
+<tr><td>init</td><td>374.145</td><td>334.628</td><td>-39.516 [-46.057, -32.976]; -10.562%</td></tr>
+</table></div>
+<h2 id="results-64k-inplace-versus-replacement-only-initialization-b-op">64K — inplace versus replacement only: initialization — B/op</h2>
+<div class="scroll"><table>
+<tr><th>Cell</th><th>O mean</th><th>N mean</th><th>N−O [CI]; %</th></tr>
+<tr><td>init</td><td>9192.000</td><td>8992.000</td><td>-200.000 [-200.000, -200.000]; -2.176%</td></tr>
+</table></div>
+<h2 id="results-pointwise-ci-counts-lower-higher-includes-zero">Pointwise CI counts (lower / higher / includes zero)</h2>
+<div class="scroll"><table>
+<tr><th>Scope / contrast / metric</th><th>Lower</th><th>Higher</th><th>Includes zero</th></tr>
+<tr><td>primary: inplace/4096 - replacement/4096: ns</td><td>0</td><td>0</td><td>18</td></tr>
+<tr><td>primary: inplace/4096 - replacement/4096: bytes</td><td>0</td><td>0</td><td>18</td></tr>
+<tr><td>primary: inplace/4096 - upstream/4096: ns</td><td>0</td><td>0</td><td>18</td></tr>
+<tr><td>primary: inplace/4096 - upstream/4096: bytes</td><td>1</td><td>0</td><td>17</td></tr>
+<tr><td>primary: replacement/4096 - upstream/4096: ns</td><td>0</td><td>0</td><td>18</td></tr>
+<tr><td>primary: replacement/4096 - upstream/4096: bytes</td><td>0</td><td>0</td><td>18</td></tr>
+<tr><td>capacity: inplace/65536 - replacement/65536: ns</td><td>1</td><td>0</td><td>8</td></tr>
+<tr><td>capacity: inplace/65536 - replacement/65536: bytes</td><td>4</td><td>0</td><td>5</td></tr>
+</table></div>
+<p>Counts are descriptions, not a familywise significance test, an NI decision, or proof over all workloads. At 4K the only allocation CI excluding zero is persistent AUTH/INDEX N−U (−40.000 B/op, CI [−60.565, −19.435]); none excludes zero against O. At 64K timing only initialization excludes zero; allocation excludes zero for initialization and three new-connection cells.</p>
+<h2 id="results-counterexamples-and-limits">Counterexamples and limits</h2>
+<p>- 4K CHURN is slower in point estimate: U/O/N 1540.779/1512.810/1653.074 ns. N−O +140.264 ns (+9.272%), CI [−264.763, +545.290]; N−U +112.295 ns (+7.288%), CI [−362.078, +586.668]. Allocation approximately 336 B/op throughout. Neither improvement nor regression established.</p>
+<p>- 4K new NORMAL/NEVER: U/O/N 633.190/927.691/1210.756 ns. N−U +577.565 [−936.948, +2092.078]; N−O +283.065 [−537.177, +1103.307]. Large positive point estimate cannot be dismissed, nor called significant. All forks are retained.</p>
+<p>- 64K steady persistent AUTH/NEVER: old/new 565.629/598.386 ns, +32.757 (+5.791%), CI [−111.968, +177.482]; allocation old/new 0.000230/16.000243 B/op, delta +16.000013 [−52.842489, +84.842515]. Persistent NORMAL/INDEX: 395.158→415.872 ns, +20.714 [−89.356, +130.783]; allocation 16.000161→48.000169 B/op, +32.000008 [−36.842480, +100.842497]. These disprove a blanket point-estimate improvement narrative, not establish regressions.</p>
+<p>- The 64K init allocation saving is not a universal steady-state allocation saving. Near-zero baseline ratios (millions of percent) are mathematically computable but not useful engineering effect sizes. Use absolute B/op and intervals.</p>
+<p>- Initialization measures construction plus empty default-4K→64K configuration, not populated late SETTINGS growth or steady-state resize latency. Functional tests cover populated semantics, not its performance. No 64K synthetic/churn timings exist in this matrix; 64K steady browser results are the available counterexamples.</p>
+<h2 id="results-reproduce-this-audit-offline-only">Reproduce this audit (offline only)</h2>
+<p><code>python3 -B analysis-audit.py</code> from this evidence directory. Reads existing raw evidence and read-only git identity; writes only the four derived analysis/report artifacts. Never run preparation, freeze, run, build, or test commands for this interpretation.</p></section></main></body></html>

@@ -26,7 +26,7 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 public class DefaultHttp2HeadersEncoder implements
     Http2HeadersEncoder, Http2HeadersEncoder.Configuration, Closeable {
 
-    private HpackEncoder hpackEncoder;
+    private final HpackEncoder hpackEncoder;
     private final SensitivityDetector sensitivityDetector;
 
     public DefaultHttp2HeadersEncoder() {
@@ -74,7 +74,7 @@ public class DefaultHttp2HeadersEncoder implements
 
     @Override
     public void maxHeaderTableSize(long max) throws Http2Exception {
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(max);
+        hpackEncoder.setMaxHeaderTableSize(max);
     }
 
     @Override

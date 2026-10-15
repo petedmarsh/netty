@@ -212,7 +212,7 @@ public class HpackEncoderAdmissionTest {
     }
 
     private void setMaxTableSize(int size) throws Http2Exception {
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(size);
+        hpackEncoder.setMaxHeaderTableSize(size);
         hpackDecoder.setMaxHeaderTableSize(size);
         assertEquals(size, hpackEncoder.getMaxHeaderTableSize());
     }

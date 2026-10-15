@@ -60,7 +60,7 @@ public class HpackEncoderTest {
     public void testSetMaxHeaderTableSizeToMaxValue() throws Http2Exception {
         hpackEncoder = new HpackEncoder(
             false, Integer.MAX_VALUE, HpackEncoder.HUFF_CODE_THRESHOLD);
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+        hpackEncoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         hpackDecoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         hpackDecoder.decode(0, buf, mockHeaders, true);
@@ -69,7 +69,7 @@ public class HpackEncoderTest {
 
     @Test
     public void testSetMaxHeaderTableSizeBelowCap() throws Http2Exception {
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(2048);
+        hpackEncoder.setMaxHeaderTableSize(2048);
         hpackDecoder.setMaxHeaderTableSize(2048);
         hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         hpackDecoder.decode(0, buf, mockHeaders, true);
@@ -77,7 +77,7 @@ public class HpackEncoderTest {
         assertEquals(2048, hpackDecoder.getMaxHeaderTableSize());
 
         buf.clear();
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(0);
+        hpackEncoder.setMaxHeaderTableSize(0);
         hpackDecoder.setMaxHeaderTableSize(0);
         hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         hpackDecoder.decode(0, buf, mockHeaders, true);
@@ -88,19 +88,36 @@ public class HpackEncoderTest {
     @Test
     public void testSetMaxHeaderTableSizeCapIndependentOfSizeHint() throws Http2Exception {
         HpackEncoder encoder = new HpackEncoder(false, 16, HpackEncoder.HUFF_CODE_THRESHOLD);
-        encoder = encoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+        encoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         assertEquals(64 * 1024, encoder.getMaxHeaderTableSize());
 
         encoder = new HpackEncoder(false, 128, HpackEncoder.HUFF_CODE_THRESHOLD);
-        encoder = encoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
+        encoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE);
         assertEquals(64 * 1024, encoder.getMaxHeaderTableSize());
     }
 
     @Test
-    public void testConfigurationWithoutGrowthRetainsEncoder() throws Http2Exception {
-        Assertions.assertSame(hpackEncoder, hpackEncoder.withMaxHeaderTableSize(4096));
-        Assertions.assertSame(hpackEncoder, hpackEncoder.withMaxHeaderTableSize(2048));
-        Assertions.assertSame(hpackEncoder, hpackEncoder.withMaxHeaderTableSize(0));
+    public void testConfigurationWithoutGrowthRetainsEncoder() throws Exception {
+        Field names = HpackEncoder.class.getDeclaredField("nameEntries");
+        Field pairs = HpackEncoder.class.getDeclaredField("nameValueEntries");
+        names.setAccessible(true);
+        pairs.setAccessible(true);
+        Object originalNames = names.get(hpackEncoder);
+        Object originalPairs = pairs.get(hpackEncoder);
+        setMaxTableSize(4096);
+        assertEquals(4096, hpackEncoder.getMaxHeaderTableSize());
+        verifyEncoding(EmptyHttp2Headers.INSTANCE); // An unchanged setting emits no update.
+        setMaxTableSize(2048);
+        assertEquals(2048, hpackEncoder.getMaxHeaderTableSize());
+        Assertions.assertSame(originalNames, names.get(hpackEncoder));
+        Assertions.assertSame(originalPairs, pairs.get(hpackEncoder));
+        setMaxTableSize(0);
+        assertEquals(0, hpackEncoder.getMaxHeaderTableSize());
+        Assertions.assertSame(originalNames, names.get(hpackEncoder));
+        Assertions.assertSame(originalPairs, pairs.get(hpackEncoder));
+        verifyEncoding(EmptyHttp2Headers.INSTANCE, 0x20); // Only the pending minimum is emitted.
+        assertEquals(0, hpackDecoder.getMaxHeaderTableSize());
+        verifyEncoding(EmptyHttp2Headers.INSTANCE); // The pending update was consumed.
     }
 
     @Test
@@ -108,7 +125,7 @@ public class HpackEncoderTest {
         assertThrows(Http2Exception.class, new Executable() {
             @Override
             public void execute() throws Throwable {
-                hpackEncoder = hpackEncoder.withMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE + 1);
+                hpackEncoder.setMaxHeaderTableSize(MAX_HEADER_TABLE_SIZE + 1);
             }
         });
     }
@@ -277,19 +294,19 @@ public class HpackEncoderTest {
     }
 
     @Test
-    public void testFinalRawBucketsAcrossTableSizes() throws Exception {
+    public void testMutableRawBucketsAcrossTableSizes() throws Exception {
         Method bucket = HpackEncoder.class.getDeclaredMethod("bucket", int.class);
         bucket.setAccessible(true);
         Field mask = HpackEncoder.class.getDeclaredField("hashMask");
         mask.setAccessible(true);
         assertEquals(short.class, mask.getType());
-        assertTrue(Modifier.isFinal(mask.getModifiers()));
+        assertTrue(!Modifier.isFinal(mask.getModifiers()));
         Field names = HpackEncoder.class.getDeclaredField("nameEntries");
         Field pairs = HpackEncoder.class.getDeclaredField("nameValueEntries");
         names.setAccessible(true);
         pairs.setAccessible(true);
-        assertTrue(Modifier.isFinal(names.getModifiers()));
-        assertTrue(Modifier.isFinal(pairs.getModifiers()));
+        assertTrue(!Modifier.isFinal(names.getModifiers()));
+        assertTrue(!Modifier.isFinal(pairs.getModifiers()));
         int expectedBuckets = 64;
         int[] capacities = { 256, 4096, 8192, 16384, 32768, 65536, 256 };
         for (int i = 0; i < capacities.length; ++i) {
@@ -316,7 +333,12 @@ public class HpackEncoderTest {
             Object[] originalPairs = (Object[]) pairs.get(encoder);
             assertEquals(buckets[i], originalNames.length);
             assertEquals(buckets[i], originalPairs.length);
-            encoder = encoder.withMaxHeaderTableSize(65536);
+            HpackEncoder original = encoder;
+            encoder.setMaxHeaderTableSize(65536);
+            Assertions.assertSame(original, encoder);
+            assertEquals(0, encoder.length());
+            Assertions.assertNotSame(originalNames, names.get(encoder));
+            Assertions.assertNotSame(originalPairs, pairs.get(encoder));
             for (int j = 0; j < 1400; ++j) {
                 encoder.encodeHeaders(0, buf, new DefaultHttp2Headers().add("x-token", dispersedValue(j)),
                         Http2HeadersEncoder.NEVER_SENSITIVE);
@@ -337,34 +359,25 @@ public class HpackEncoderTest {
             }
             Object grownNames = names.get(encoder);
             Object grownPairs = pairs.get(encoder);
-            encoder = encoder.withMaxHeaderTableSize(0);
-            encoder = encoder.withMaxHeaderTableSize(65536);
+            encoder.setMaxHeaderTableSize(0);
+            encoder.setMaxHeaderTableSize(65536);
             Assertions.assertSame(grownNames, names.get(encoder));
             Assertions.assertSame(grownPairs, pairs.get(encoder));
         }
     }
 
     @Test
-    public void testPopulatedReplacementIsIndependentAndPreservesPendingMinimum() throws Exception {
+    public void testPopulatedGrowthRetainsNodesAndPreservesPendingMinimum() throws Exception {
         setMaxTableSize(6144);
         for (int i = 0; i < 100; ++i) {
             roundTripAndClear("x-copy-" + i % 10, dispersedValue(i));
         }
         HpackEncoder original = hpackEncoder;
         original.setMaxHeaderListSize(12345);
-        // A pending minimum must survive a subsequent replacement without changing the source.
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(6000);
-        setMaxTableSize(65536);
-        Assertions.assertNotSame(original, hpackEncoder);
-        assertEquals(6000, original.getMaxHeaderTableSize());
-        assertEquals(12345, hpackEncoder.getMaxHeaderListSize());
-        assertEquals(original.size(), hpackEncoder.size());
-        for (int i = 0; i < original.length(); ++i) {
-            HpackHeaderField oldField = original.getHeaderField(i);
-            HpackHeaderField newField = hpackEncoder.getHeaderField(i);
-            Assertions.assertNotSame(oldField, newField);
-            Assertions.assertSame(oldField.name, newField.name);
-            Assertions.assertSame(oldField.value, newField.value);
+        long originalSize = original.size();
+        HpackHeaderField[] oldFields = new HpackHeaderField[original.length()];
+        for (int i = 0; i < oldFields.length; ++i) {
+            oldFields[i] = original.getHeaderField(i);
         }
         Field names = HpackEncoder.class.getDeclaredField("nameEntries");
         names.setAccessible(true);
@@ -379,20 +392,33 @@ public class HpackEncoderTest {
                 }
             }
         }
+        // A pending minimum must survive growth of the same encoder.
+        hpackEncoder.setMaxHeaderTableSize(6000);
+        setMaxTableSize(65536);
+        Assertions.assertSame(original, hpackEncoder);
+        assertEquals(65536, original.getMaxHeaderTableSize());
+        assertEquals(12345, hpackEncoder.getMaxHeaderListSize());
+        assertEquals(originalSize, hpackEncoder.size());
+        for (int i = 0; i < oldFields.length; ++i) {
+            Assertions.assertSame(oldFields[i], hpackEncoder.getHeaderField(i));
+        }
         for (Object first : (Object[]) names.get(hpackEncoder)) {
             if (first != null) {
                 Field next = first.getClass().getDeclaredField("next");
                 next.setAccessible(true);
                 for (Object entry = first; entry != null; entry = next.get(entry)) {
-                    assertTrue(!oldNodes.contains(entry));
+                    assertTrue(oldNodes.remove(entry));
                 }
             }
         }
+        assertTrue(oldNodes.isEmpty());
         // Observe both pending updates, and then decode them against the populated peer.
         hpackEncoder.encodeHeaders(0, buf, new DefaultHttp2Headers(), Http2HeadersEncoder.NEVER_SENSITIVE);
         ByteBuf expected = Unpooled.buffer();
         try {
-            HpackEncoder pending = new HpackEncoder().withMaxHeaderTableSize(6000).withMaxHeaderTableSize(65536);
+            HpackEncoder pending = new HpackEncoder();
+            pending.setMaxHeaderTableSize(6000);
+            pending.setMaxHeaderTableSize(65536);
             pending.encodeHeaders(0, expected, new DefaultHttp2Headers(), Http2HeadersEncoder.NEVER_SENSITIVE);
             assertEquals(expected, buf);
         } finally {
@@ -400,18 +426,58 @@ public class HpackEncoderTest {
         }
         hpackDecoder.decode(0, buf, new DefaultHttp2Headers(), true);
         buf.clear();
-        // Clear the original: none of the cloned links or name representatives may be unlinked.
-        original.withMaxHeaderTableSize(0);
+        // Retained entries must still replay as indexed fields after relinking.
         for (int i = 0; i < 100; ++i) {
             roundTripAndClear("x-copy-" + i % 10, dispersedValue(i));
             assertEquals(100, hpackEncoder.length());
         }
-        original = original.withMaxHeaderTableSize(65536);
-        original.encodeHeaders(0, buf, new DefaultHttp2Headers().add("x-independent", "v"),
-                Http2HeadersEncoder.NEVER_SENSITIVE);
-        assertEquals(1, original.length());
-        assertEquals(100, hpackEncoder.length());
+        // Fill the table exactly, then force one FIFO eviction after the populated rehash.
+        setMaxTableSize((int) originalSize);
+        verifyRoundTrip(EmptyHttp2Headers.INSTANCE);
         buf.clear();
+        String replacement = new String(new char[dispersedValue(0).length()]).replace('\0', 'z');
+        roundTripAndClear("x-copy-0", replacement);
+        assertEquals(100, hpackEncoder.length());
+        assertEquals(originalSize, hpackEncoder.size());
+        for (int i = 1; i < 100; ++i) {
+            Assertions.assertSame(oldFields[i - 1], hpackEncoder.getHeaderField(i));
+            assertEquals(oldFields[i - 1].name.toString(), hpackDecoder.getHeaderField(i).name.toString());
+            assertEquals(oldFields[i - 1].value.toString(), hpackDecoder.getHeaderField(i).value.toString());
+        }
+        assertEquals(replacement, hpackEncoder.getHeaderField(0).value.toString());
+        assertEquals(replacement, hpackDecoder.getHeaderField(0).value.toString());
+        // The oldest survivor now has dynamic index 161 (HPACK prefix integer: 127 + 34).
+        verifyEncoding(new DefaultHttp2Headers().add("x-copy-1", dispersedValue(1)), 0xff, 34);
+        // The evicted oldest pair must be a literal, not a stale index into the relinked buckets.
+        verifyRoundTrip(new DefaultHttp2Headers().add("x-copy-0", dispersedValue(0)));
+        assertEquals(0x40, buf.getUnsignedByte(0) & 0xc0);
+        assertEquals(hpackEncoder.length(), hpackDecoder.length());
+        assertEquals(hpackEncoder.size(), hpackDecoder.size());
+        buf.clear();
+    }
+
+    @Test
+    public void testPendingZeroAndGrowthSurviveHeaderListRejection() throws Exception {
+        HpackEncoder original = hpackEncoder;
+        hpackEncoder.setMaxHeaderTableSize(0);
+        hpackEncoder.setMaxHeaderTableSize(65536);
+        hpackEncoder.setMaxHeaderListSize(0);
+        Assertions.assertThrows(Http2Exception.class, () -> hpackEncoder.encodeHeaders(0, buf,
+                new DefaultHttp2Headers().add("x", "v"), Http2HeadersEncoder.NEVER_SENSITIVE));
+        assertEquals(0, buf.readableBytes());
+        for (long invalid : new long[] { -1, MAX_HEADER_TABLE_SIZE + 1 }) {
+            Assertions.assertThrows(Http2Exception.class, () -> hpackEncoder.setMaxHeaderTableSize(invalid));
+        }
+        hpackEncoder.encodeHeaders(0, buf, new DefaultHttp2Headers(), Http2HeadersEncoder.NEVER_SENSITIVE);
+        Assertions.assertSame(original, hpackEncoder);
+        assertEquals(65536, hpackEncoder.getMaxHeaderTableSize());
+        assertEquals(0, hpackEncoder.getMaxHeaderListSize());
+        assertEquals(5, buf.readableBytes());
+        assertEquals(0x20, buf.readUnsignedByte());
+        assertEquals(0x3f, buf.readUnsignedByte());
+        assertEquals(0xe1, buf.readUnsignedByte());
+        assertEquals(0xff, buf.readUnsignedByte());
+        assertEquals(0x03, buf.readUnsignedByte());
     }
 
     @Test
@@ -419,19 +485,19 @@ public class HpackEncoderTest {
         roundTripAndClear("x-before", "v");
         HpackEncoder original = hpackEncoder;
         for (long invalid : new long[] { -1, MAX_HEADER_TABLE_SIZE + 1 }) {
-            Assertions.assertThrows(Http2Exception.class, () -> original.withMaxHeaderTableSize(invalid));
+            Assertions.assertThrows(Http2Exception.class, () -> original.setMaxHeaderTableSize(invalid));
             assertEquals(4096, original.getMaxHeaderTableSize());
             assertEquals(1, original.length());
         }
         verifyEncoding(new DefaultHttp2Headers().add("x-before", "v"), 0xbe);
-        Assertions.assertSame(original, original.withMaxHeaderTableSize(4096));
+        original.setMaxHeaderTableSize(4096);
     }
 
     @Test
-    public void testReplacementPreservesIgnoreAndHuffmanConfiguration() throws Exception {
+    public void testGrowthPreservesIgnoreAndHuffmanConfiguration() throws Exception {
         HpackEncoder encoder = new HpackEncoder(true, 64, 0);
         encoder.setMaxHeaderListSize(0);
-        encoder = encoder.withMaxHeaderTableSize(65536);
+        encoder.setMaxHeaderTableSize(65536);
         encoder.encodeHeaders(0, buf, new DefaultHttp2Headers(), Http2HeadersEncoder.NEVER_SENSITIVE);
         buf.clear();
         encoder.encodeHeaders(0, buf, new DefaultHttp2Headers().add("cookie", "aaaaaaaa"),
@@ -906,7 +972,7 @@ public class HpackEncoderTest {
     }
 
     private void setMaxTableSize(int maxHeaderTableSize) throws Http2Exception {
-        hpackEncoder = hpackEncoder.withMaxHeaderTableSize(maxHeaderTableSize);
+        hpackEncoder.setMaxHeaderTableSize(maxHeaderTableSize);
         hpackDecoder.setMaxHeaderTableSize(maxHeaderTableSize);
     }
 

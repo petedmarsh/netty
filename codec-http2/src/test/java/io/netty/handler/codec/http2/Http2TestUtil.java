@@ -135,7 +135,7 @@ public final class Http2TestUtil {
         HpackEncoder hpackEncoder = new HpackEncoder(false, 16, 0);
         ByteBuf buf = Unpooled.buffer();
         try {
-            hpackEncoder = hpackEncoder.withMaxHeaderTableSize(maxHeaderTableSize);
+            hpackEncoder.setMaxHeaderTableSize(maxHeaderTableSize);
             hpackEncoder.setMaxHeaderListSize(maxHeaderListSize);
             hpackEncoder.encodeHeaders(0, buf, EmptyHttp2Headers.INSTANCE, Http2HeadersEncoder.NEVER_SENSITIVE);
         } finally  {

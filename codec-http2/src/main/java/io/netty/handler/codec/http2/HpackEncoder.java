@@ -64,10 +64,10 @@ final class HpackEncoder {
     static final int NOT_FOUND = -1;
     static final int HUFF_CODE_THRESHOLD = 512;
     // a hash map of header fields keyed by header name
-    private final NameEntry[] nameEntries;
+    private NameEntry[] nameEntries;
 
     // a hash map of header fields keyed by header name and value
-    private final NameValueEntry[] nameValueEntries;
+    private NameValueEntry[] nameValueEntries;
 
     private static final int MAX_LOCAL_TABLE_SIZE = 64 * 1024;
     // Small tables retain the original implicit bound (at most 128 entries). Large-table
@@ -80,7 +80,7 @@ final class HpackEncoder {
     private NameValueEntry latest = head;
 
     private final HpackHuffmanEncoder hpackHuffmanEncoder = new HpackHuffmanEncoder();
-    private final short hashMask;
+    private short hashMask;
     private final boolean ignoreMaxHeaderListSize;
     private final int huffCodeThreshold;
     private long size;
@@ -108,42 +108,42 @@ final class HpackEncoder {
      * Creates a new encoder.
      */
     HpackEncoder(boolean ignoreMaxHeaderListSize, int arraySizeHint, int huffCodeThreshold) {
-        this(ignoreMaxHeaderListSize, arraySizeHint, huffCodeThreshold, 128);
-    }
 
-    private HpackEncoder(boolean ignoreMaxHeaderListSize, int arraySizeHint, int huffCodeThreshold, int maxBuckets) {
         this.ignoreMaxHeaderListSize = ignoreMaxHeaderListSize;
         maxHeaderTableSize = DEFAULT_HEADER_TABLE_SIZE;
         maxHeaderListSize = MAX_HEADER_LIST_SIZE;
         // Preserve upstream allocation and raw bucket mapping until SETTINGS requires growth.
-        nameEntries = new NameEntry[findNextPositivePowerOfTwo(max(2, min(arraySizeHint, maxBuckets)))];
+        nameEntries = new NameEntry[findNextPositivePowerOfTwo(max(2, min(arraySizeHint, 128)))];
         nameValueEntries = new NameValueEntry[nameEntries.length];
         hashMask = (short) (nameEntries.length - 1);
         this.huffCodeThreshold = huffCodeThreshold;
     }
 
-    private HpackEncoder(HpackEncoder source, int buckets) {
-        this(source.ignoreMaxHeaderListSize, buckets, source.huffCodeThreshold, 1024);
-        maxHeaderTableSize = source.maxHeaderTableSize;
-        maxHeaderListSize = source.maxHeaderListSize;
-        pendingHeaderTableSizeUpdate = source.pendingHeaderTableSizeUpdate;
-        pendingMinHeaderTableSize = source.pendingMinHeaderTableSize;
-        // Clone oldest first, prepending hash links while appending FIFO links. Never mutate
-        // source nodes: the previous encoder remains independently usable if construction fails.
-        for (NameValueEntry entry = source.head.after; entry != null; entry = entry.after) {
-            int bucket = bucket(entry.hash);
-            NameValueEntry copy = new NameValueEntry(entry.hash, entry.name, entry.value,
-                    entry.counter, nameValueEntries[bucket]);
-            nameValueEntries[bucket] = copy;
-            latest.after = copy;
-            latest = copy;
+    private void growBuckets(int buckets) {
+        // Allocate both arrays before touching any links. Rehash uses only cached hashes,
+        // so no user CharSequence callbacks can interrupt the relinking.
+        NameEntry[] newNames = new NameEntry[buckets];
+        NameValueEntry[] newPairs = new NameValueEntry[buckets];
+        short newMask = (short) (buckets - 1);
+        // FIFO is oldest first: prepending preserves newest-first pair lookup order.
+        // Leave after links, counters, and the name representatives unchanged.
+        for (NameValueEntry entry = head.after; entry != null; entry = entry.after) {
+            int bucket = entry.hash & newMask;
+            entry.next = newPairs[bucket];
+            newPairs[bucket] = entry;
         }
-        for (NameEntry first : source.nameEntries) {
-            for (NameEntry entry = first; entry != null; entry = entry.next) {
-                addNameEntry(entry.name, entry.hash, entry.counter);
+        for (NameEntry first : nameEntries) {
+            for (NameEntry entry = first; entry != null;) {
+                NameEntry next = entry.next;
+                int bucket = entry.hash & newMask;
+                entry.next = newNames[bucket];
+                newNames[bucket] = entry;
+                entry = next;
             }
         }
-        size = source.size;
+        nameEntries = newNames;
+        nameValueEntries = newPairs;
+        hashMask = newMask;
     }
 
     /**
@@ -183,7 +183,7 @@ final class HpackEncoder {
         if (this.pendingHeaderTableSizeUpdate) {
             this.pendingHeaderTableSizeUpdate = false;
             // Casting to integer is safe as we verified the table size is a valid unsigned int in
-            // withMaxHeaderTableSize().
+            // setMaxHeaderTableSize().
             if (this.pendingMinHeaderTableSize < this.maxHeaderTableSize) {
                 // The table size shrunk and increased again.
                 encodeInteger(out, 0x20, 5, this.pendingMinHeaderTableSize);
@@ -280,10 +280,9 @@ final class HpackEncoder {
     }
 
     /**
-     * Set the maximum table size, returning a replacement when the final buckets must grow.
-     * Callers must retain the returned encoder. Bucket capacity never shrinks.
+     * Set the maximum table size. Bucket capacity grows in place and never shrinks.
      */
-    public HpackEncoder withMaxHeaderTableSize(long maxHeaderTableSize) throws Http2Exception {
+    public void setMaxHeaderTableSize(long maxHeaderTableSize) throws Http2Exception {
         if (maxHeaderTableSize < MIN_HEADER_TABLE_SIZE || maxHeaderTableSize > MAX_HEADER_TABLE_SIZE) {
             throw connectionError(PROTOCOL_ERROR, "Header Table Size must be >= %d and <= %d but was %d",
               MIN_HEADER_TABLE_SIZE, MAX_HEADER_TABLE_SIZE, maxHeaderTableSize);
@@ -291,16 +290,17 @@ final class HpackEncoder {
         // Bound memory independently of both the peer's limit and the initial bucket hint.
         maxHeaderTableSize = Math.min(maxHeaderTableSize, MAX_LOCAL_TABLE_SIZE);
         if (this.maxHeaderTableSize == maxHeaderTableSize) {
-            return this;
+            return;
         }
         int buckets = maxHeaderTableSize <= DEFAULT_HEADER_TABLE_SIZE ? nameEntries.length :
                 findNextPositivePowerOfTwo((int) ((maxHeaderTableSize + 63) / 64));
-        HpackEncoder encoder = buckets > nameEntries.length ? new HpackEncoder(this, buckets) : this;
-        encoder.pendingHeaderTableSizeUpdate = true;
-        encoder.pendingMinHeaderTableSize = Math.min(encoder.pendingMinHeaderTableSize, maxHeaderTableSize);
-        encoder.maxHeaderTableSize = maxHeaderTableSize;
-        encoder.ensureCapacity(0);
-        return encoder;
+        if (buckets > nameEntries.length) {
+            growBuckets(buckets);
+        }
+        pendingHeaderTableSizeUpdate = true;
+        pendingMinHeaderTableSize = Math.min(pendingMinHeaderTableSize, maxHeaderTableSize);
+        this.maxHeaderTableSize = maxHeaderTableSize;
+        ensureCapacity(0);
     }
 
     /**
